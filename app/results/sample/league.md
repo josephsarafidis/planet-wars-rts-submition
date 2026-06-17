@@ -7,6 +7,6 @@
 | **Overall Average** | **100.0** | **12** |
 
 AVG=100.0
-Average Action Time: 2.34 ms
+Average Action Time: 2.41 ms
 
 Total Timeouts: 0

@@ -13,7 +13,7 @@ import torch.nn as nn
 import importlib
 from pathlib import Path
 import traceback
-
+from model_architecture import SpatialGNNExtractor 
 
 N_PLANETS = 30
 
@@ -50,7 +50,7 @@ def manual_load_model(model_path):
     act_space = spaces.Discrete(93)
     dummy_env = DummyVecEnv([lambda: DummyTrainingEnv(obs_space, act_space)])
     
-    from main import SpatialGNNExtractor 
+
     
     policy_kwargs = {
         "features_extractor_class": SpatialGNNExtractor,
@@ -64,18 +64,10 @@ def manual_load_model(model_path):
         policy_kwargs=policy_kwargs,
         device="cpu"
     )
+    # 2. Φορτώνεις τα weights κατευθείαν (χωρίς pickle, χωρίς classes, χωρίς imports)
+    state_dict = torch.load(model_path, map_location='cpu')
+    new_model.policy.load_state_dict(state_dict)
     
-    print("Loading weights directly from policy.pth...", flush=True)
-    with zipfile.ZipFile(model_path, 'r') as z: 
-        # Ανοίγουμε απευθείας το αρχείο των weights
-        with z.open('policy.pth') as f:
-            # Το torch.load διαβάζει το binary .pth αρχείο χωρίς να νοιάζεται για pickles
-            state_dict = torch.load(f, map_location='cpu')
-            
-    # Φόρτωση των weights
-    new_model.policy.load_state_dict(state_dict, strict=False)
-    
-    print("Manual load successful!", flush=True)
     return new_model
 
 
@@ -91,7 +83,7 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
 
 
             BASE_DIR = Path(__file__).resolve().parent.parent
-            MODEL_PATH = BASE_DIR / "models" / "selfplay_champion.zip"
+            MODEL_PATH = BASE_DIR / "models" / "clean_weights.pth"
             
             self.model = manual_load_model(str(MODEL_PATH))
                     
