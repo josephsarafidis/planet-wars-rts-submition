@@ -1,4 +1,4 @@
-### RL_Gen25F_selfplay_champion.zip (Remote) Evaluation
+### RL_Gen25F_clean_weights.pth (Remote) Evaluation
 
 | Opponent | Win Rate % | Games Played |
 |----------|------------|---------------|
@@ -7,6 +7,6 @@
 | **Overall Average** | **100.0** | **12** |
 
 AVG=100.0
-Average Action Time: 2.41 ms
+Average Action Time: 2.39 ms
 
 Total Timeouts: 0

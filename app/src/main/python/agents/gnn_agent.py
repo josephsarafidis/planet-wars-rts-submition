@@ -75,7 +75,7 @@ def manual_load_model(model_path):
 class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
     
 
-    def __init__(self, model_path: str = "models/selfplay_champion.zip", max_planets: int = 30, det: bool = True):
+    def __init__(self, model_path: str = "models/clean_weights.pth", max_planets: int = 30, det: bool = True):
         super().__init__()
         self.model_name = os.path.basename(model_path)
         try:

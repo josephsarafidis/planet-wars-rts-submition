@@ -11,6 +11,6 @@ import torch.nn as nn
 
 if __name__ == "__main__":
     print("Running Agent Server")
-    agent =PureRandomAgent()
+    agent =EventDrivenAllPlanetsGNNAgent()
     asyncio.run(GameServerAgent(host="0.0.0.0", port=8080, agent=agent).start())
 
