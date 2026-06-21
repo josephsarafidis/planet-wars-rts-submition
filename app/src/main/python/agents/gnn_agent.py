@@ -46,8 +46,8 @@ from sb3_contrib import MaskablePPO
 def manual_load_model(model_path):
     print("Initializing fresh model architecture...", flush=True)
     
-    obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(694,), dtype=np.float32)
-    act_space = spaces.Discrete(93)
+    obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(844,), dtype=np.float32)
+    act_space = spaces.Discrete(165)
     dummy_env = DummyVecEnv([lambda: DummyTrainingEnv(obs_space, act_space)])
     
 
@@ -55,7 +55,7 @@ def manual_load_model(model_path):
     policy_kwargs = {
         "features_extractor_class": SpatialGNNExtractor,
         "features_extractor_kwargs": {"n_planets": 30},
-        "net_arch": {"pi": [256, 256], "vf": [1024, 512, 512, 256]}
+        "net_arch": {"pi": [1024, 512, 256], "vf": [1024, 512, 256]}
     }
     
     new_model = MaskablePPO(
@@ -69,12 +69,9 @@ def manual_load_model(model_path):
     new_model.policy.load_state_dict(state_dict)
     
     return new_model
-
-
-
-class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
     
-
+    
+class GNNAgent(PlanetWarsPlayer):
     def __init__(self, model_path: str = "models/clean_weights.pth", max_planets: int = 30, det: bool = True):
         super().__init__()
         self.model_name = os.path.basename(model_path)
@@ -88,20 +85,27 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
             self.model = manual_load_model(str(MODEL_PATH))
                     
             print(f"Loaded Advanced GNN Model successfully from {model_path}")
-            self.agent_type = f"RL_Gen25F_{self.model_name}" 
+            self.agent_type = self.model_name 
 
         except Exception:
             traceback.print_exc()
             raise
 
+
         self.max_planets = max_planets
-        self.features_per_node = 23 
-        self.n_globals = 4
-        self.fleet_buckets = [0.1, 0.33, 0.8]
-        self.total_action_bins = (self.max_planets + 1) * len(self.fleet_buckets)
-        self.planet_cooldown = 50
         self.det = det
+        self.features_per_node = 28 # 24  + 4 zeroed out
+        self.n_globals = 4
+        self.fleet_buckets = [0.1, 0.25, 0.5, 0.75, 1.0] # The 5 buckets
+        self.old_flag_count = 5 # Kept to maintain the 10 meta-action bins
         
+        self.base_action_bins = (self.max_planets + 1) * len(self.fleet_buckets)
+        self.meta_action_bins = self.old_flag_count * 2
+        self.total_action_bins = self.base_action_bins + self.meta_action_bins
+        
+        self.planet_cooldown = 50
+        
+        # --- INTERNAL MEMORY ---
         self.planet_ready_tick = None
         self.prev_enemy_fleets = 0
         self.valid_planets = []
@@ -113,11 +117,12 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
         
         # Reset memory for the new match
         self.planet_ready_tick = None
+        self.sos_ready_tick = 0
         self.prev_enemy_fleets = 0
         self.valid_planets = []
 
     # ==========================================
-    # ACTION MASKING LOGIC (100% Matched to Training Env)
+    # ACTION MASKING LOGIC 
     # ==========================================
     def is_action_allowed(self, target_idx: int, ratio_idx: int, active_planet, game_state: GameState, obs_mapping: dict) -> bool:
         if target_idx == self.max_planets: return True
@@ -129,20 +134,21 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
         if not target_planet or target_planet.id == active_planet.id: return False
         
         ratio_to_send = self.fleet_buckets[ratio_idx]
-        if active_planet.n_ships * ratio_to_send <= 5: return False
+        if active_planet.n_ships * ratio_to_send < 1: return False
             
         return True
 
     def get_action_mask(self, active_planet, game_state: GameState, obs_mapping: dict) -> np.ndarray:
         masks = np.zeros(self.total_action_bins, dtype=np.int8)
         
+        # 1. Base Dispatch Actions
         for target_idx in range(self.max_planets + 1):
             for ratio_idx in range(len(self.fleet_buckets)):
                 if self.is_action_allowed(target_idx, ratio_idx, active_planet, game_state, obs_mapping):
                     flat_action_idx = (target_idx * len(self.fleet_buckets)) + ratio_idx
                     masks[flat_action_idx] = 1
 
-        # Fallback for safety (same logic as target_idx == max_planets)
+        # Fallback for safety
         if not masks.any():
             for r in range(len(self.fleet_buckets)):
                 masks[(self.max_planets * len(self.fleet_buckets)) + r] = 1
@@ -238,13 +244,21 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
                     obs[idx + 14 + (e_idx * 2)] = 0.0
 
             obs[idx + 19] = float(planet.growth_rate) / self.params.max_growth_rate
-            obs[idx + 20] = 1.0 if planet.id == active_planet.id else 0.0
-            obs[idx + 21] = planet.position.x / max_coord
-            obs[idx + 22] = planet.position.y / max_coord
+            
+            # --- META ACTIONS: Ensure indices 20-24 are strictly zeroed out ---
+            cd_left = max(0, self.planet_ready_tick.get(planet.id, 0) - game_state.game_tick)
+            obs[idx + 20] = min(1.0, cd_left / 50.0) # 50.0 είναι το PLANET_COOLDOWN            
+            
+            for f_idx in range(self.old_flag_count - 1):
+                obs[idx + 21 + f_idx] = 0.0
+                
+            obs[idx + 25] = 1.0 if planet.id == active_planet.id else 0.0
+            obs[idx + 26] = planet.position.x / max_coord
+            obs[idx + 27] = planet.position.y / max_coord
             
         for i in range(n_planets_current, self.max_planets):
             idx = i * self.features_per_node
-            obs[idx : idx + 23] = 0.0
+            obs[idx : idx + self.features_per_node] = 0.0
 
         global_idx = self.max_planets * self.features_per_node
         obs[global_idx] = np.log1p(max(0.0, global_f_ships))
@@ -254,6 +268,9 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
             
         return obs, mapping
 
+    # ==========================================
+    # DECISION LOOP
+    # ==========================================
     # ==========================================
     # DECISION LOOP
     # ==========================================
@@ -268,10 +285,20 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
 
         friendly_planets = [p for p in game_state.planets if p.owner == self.player]
 
-        current_enemy_fleets = sum(
-            1 for p in game_state.planets 
-            if getattr(p, 'transporter', None) is not None and p.transporter.owner == self.player.opponent()
-        )
+        # 1. Map incoming enemy fleets to destinations and track total fleets
+        incoming_enemy_ships = {p.id: 0 for p in game_state.planets}
+        incoming_friendly_ships = {p.id: 0 for p in game_state.planets}
+
+        current_enemy_fleets = 0
+        
+        for p in game_state.planets:
+            if getattr(p, 'transporter', None) is not None and p.transporter.owner == self.player.opponent():
+                current_enemy_fleets += 1
+                incoming_enemy_ships[p.transporter.destination_index] += p.transporter.n_ships
+            elif getattr(p, 'transporter', None) is not None and p.transporter.owner == self.player:
+                incoming_friendly_ships[p.transporter.destination_index] += p.transporter.n_ships
+
+        # Global interrupt: Wake up friendly planets if enemy launched
         enemy_launched = current_enemy_fleets > self.prev_enemy_fleets
         self.prev_enemy_fleets = current_enemy_fleets
 
@@ -281,6 +308,74 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
                 if self.planet_ready_tick.get(p.id, 0) > current_tick:
                     self.planet_ready_tick[p.id] = current_tick
 
+       # ==========================================
+        # 2. HEURISTIC OVERRIDE LOGIC: OPPORTUNISTIC SNIPER
+        # ==========================================
+        valid_sources = [
+            p for p in friendly_planets 
+            if p.n_ships > 5 
+            and getattr(p, 'transporter', None) is None 
+            and current_tick >= self.planet_ready_tick.get(p.id, 0)
+        ]
+        
+        non_friendly_planets = [p for p in game_state.planets if p.owner != self.player]
+        
+        best_attack = None
+        best_roi_score = -1.0  # Threshold for "is this attack worth overriding the NN?"
+
+        for source in valid_sources:
+            # Localized Danger Check: Ensure THIS source planet is safe, ignore the rest of the board.
+            # We keep enough ships to survive incoming enemies, plus a buffer of 3 just in case.
+            minimum_safe_garrison = incoming_enemy_ships[source.id] + 3
+
+            for target in non_friendly_planets:
+                # If we are already sending ships there, trust the existing fleet and move on
+                if incoming_friendly_ships[target.id] > 0:
+                    continue
+                
+                eta = source.position.distance(target.position) / self.params.transporter_speed
+                
+                growth_defense = target.growth_rate * eta if target.owner == self.player.opponent() else 0
+                target_defense = target.n_ships + incoming_enemy_ships[target.id] + growth_defense
+                
+                required_attack_ships = int(target_defense) + 2
+                
+                # Check if we have enough to attack AND defend our home simultaneously
+                if source.n_ships >= (required_attack_ships + minimum_safe_garrison):
+                    
+                    # --- Calculate ROI (Return on Investment) ---
+                    # High growth, cheap required ships, and short distance score the highest.
+                    roi_score = (target.growth_rate * 5000.0) / (required_attack_ships * eta)
+                    #print(required_attack_ships, eta)
+                    # Neutral planets don't spawn enemy fleets, making them safer investments early game
+                    if target.owner == Player.Neutral:
+                        roi_score *= 1.5 
+                    #print(roi_score)
+                    # Find the absolute best move on the board
+                    if roi_score > best_roi_score:
+                        best_roi_score = roi_score
+                        best_attack = (source, target, required_attack_ships)
+
+        # Execute ONLY if we found a highly profitable move (adjust 2.0 threshold based on testing)
+        if best_attack and best_roi_score > 1:
+            source, target, required_attack_ships = best_attack
+            
+            self.planet_ready_tick[source.id] = current_tick + self.planet_cooldown
+            
+            if source.id in self.valid_planets:
+                self.valid_planets.remove(source.id)
+                
+            #print(f"[Heuristic] Sniping planet {target.id} (Growth: {target.growth_rate}) with {required_attack_ships} ships from {source.id}. ROI: {best_roi_score:.2f}")
+            return Action(
+                player_id=self.player,
+                source_planet_id=source.id,
+                destination_planet_id=target.id,
+                num_ships=required_attack_ships
+            )
+
+        # ==========================================
+        # 3. AI FALLBACK LOGIC
+        # ==========================================
         if len(self.valid_planets) == 0:
             self.valid_planets = [
                 p.id for p in friendly_planets 
@@ -291,8 +386,6 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
 
         while len(self.valid_planets) > 0:
             active_planet_id = self.valid_planets.pop(0)
-            
-            # Safe object retrieval (replaces the index bug)
             active_planet = next((p for p in game_state.planets if p.id == active_planet_id), None)
 
             if not active_planet or active_planet.owner != self.player or active_planet.n_ships <= 5 or getattr(active_planet, 'transporter', None) is not None:
@@ -304,26 +397,40 @@ class EventDrivenAllPlanetsGNNAgent(PlanetWarsPlayer):
             action_flat, _ = self.model.predict(obs, action_masks=action_mask, deterministic=self.det)
             action_int = int(action_flat)
             
-            sorted_target_idx = action_int // len(self.fleet_buckets)
-            ratio_idx = action_int % len(self.fleet_buckets)
-            
-            self.planet_ready_tick[active_planet.id] = current_tick + self.planet_cooldown
+            if action_int < self.base_action_bins:
+                # --- FLEET DISPATCH ACTION ---
+                sorted_target_idx = action_int // len(self.fleet_buckets)
+                ratio_idx = action_int % len(self.fleet_buckets)
+                
+                self.planet_ready_tick[active_planet.id] = current_tick + self.planet_cooldown
 
-            if sorted_target_idx < self.max_planets:
-                real_target_id = obs_mapping.get(sorted_target_idx, None)
-                if real_target_id is not None and real_target_id != active_planet.id:
-                    ratio_to_send = self.fleet_buckets[ratio_idx]
-                    ships_to_send = int(active_planet.n_ships * ratio_to_send)
-                    
-                    if ships_to_send > 5:
-                        return Action(
-                                player_id=self.player,
-                                source_planet_id=active_planet.id,
-                                destination_planet_id=real_target_id,
-                                num_ships=ships_to_send
-                            )
+                if sorted_target_idx < self.max_planets:
+                    real_target_id = obs_mapping.get(sorted_target_idx, None)
+                    if real_target_id is not None and real_target_id != active_planet.id:
+                        ratio_to_send = self.fleet_buckets[ratio_idx]
+                        ships_to_send = int(active_planet.n_ships * ratio_to_send)
+                        
+                        if ships_to_send > 5:
+                            return Action(
+                                    player_id=self.player,
+                                    source_planet_id=active_planet.id,
+                                    destination_planet_id=real_target_id,
+                                    num_ships=ships_to_send
+                                )
+                return Action.do_nothing()
+            else:
+                print("Error, this action should have been masked")
+                return Action.do_nothing()
             
         return Action.do_nothing()
 
+
     def get_agent_type(self) -> str:
         return self.agent_type
+
+
+
+
+
+
+
