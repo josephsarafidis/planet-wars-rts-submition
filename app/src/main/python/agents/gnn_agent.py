@@ -48,8 +48,8 @@ from sb3_contrib import MaskablePPO
 def manual_load_model(model_path):
     print("Initializing fresh model architecture...", flush=True)
     
-    obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(844,), dtype=np.float32)
-    act_space = spaces.Discrete(165)
+    obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(754,), dtype=np.float32)
+    act_space = spaces.Discrete(151)
     dummy_env = DummyVecEnv([lambda: DummyTrainingEnv(obs_space, act_space)])
     
 
@@ -73,10 +73,9 @@ def manual_load_model(model_path):
     return new_model
     
     
-    
-
+ 
 class GNNAgent(PlanetWarsPlayer):
-    def __init__(self, model_path: str ="clean_weights.pth", max_planets: int = 30, det: bool = True):
+    def __init__(self, model_path: str = "clean_weights.pth", max_planets: int = 30, det: bool = True, heuristic_fallback: bool=True):
         super().__init__()
         self.model_name = os.path.basename(model_path)
         try:
@@ -99,32 +98,33 @@ class GNNAgent(PlanetWarsPlayer):
         self.det = det
         
         # --- ARCHITECTURE CONFIG ---
-        self.features_per_node = 28 # 24 + 4 zeroed out
+        self.features_per_node = 25
         self.n_globals = 4
-        self.fleet_buckets = [0.1, 0.25, 0.5, 0.75, 1.0] # The 5 buckets
-        self.old_flag_count = 5 # Kept to maintain the action bins size
+        self.fleet_buckets = [0.1, 0.25, 0.5, 0.75, 1.0] 
         
-        self.base_action_bins = (self.max_planets + 1) * len(self.fleet_buckets)
-        self.meta_action_bins = self.old_flag_count * 2
-        self.total_action_bins = self.base_action_bins + self.meta_action_bins
+        self.heuristic_enabled = heuristic_fallback
+        self.attack_action_bins = self.max_planets * len(self.fleet_buckets)
+        self.noop_action_idx = self.attack_action_bins
+        self.total_action_bins = self.attack_action_bins + 1
         
         self.planet_cooldown = 50
         
         # --- INTERNAL MEMORY ---
         self.planet_ready_tick = None
+        self.max_eta = None
 
     def prepare_to_play_as(self, player: Player, params: GameParams, opponent: Optional[str] = None):
         super().prepare_to_play_as(player, params, opponent)
         self.params = params
         self.player = player
         self.planet_ready_tick = None
-
+        self.max_eta = np.sqrt(self.params.width**2 + self.params.height**2) / self.params.transporter_speed
     # ==========================================
     # ACTION MASKING LOGIC 
     # ==========================================
     def is_action_allowed(self, target_idx: int, ratio_idx: int, active_planet, game_state: GameState, obs_mapping: dict) -> bool:
-        if target_idx == self.max_planets: 
-            return True # NOOP is always allowed
+        if target_idx == 0: 
+            return False # Cannot attack self (slot 0 is always active_planet)
         
         real_target_id = obs_mapping.get(target_idx, None)
         if real_target_id is None: 
@@ -135,7 +135,7 @@ class GNNAgent(PlanetWarsPlayer):
             return False
         
         ratio_to_send = self.fleet_buckets[ratio_idx]
-        if int(active_planet.n_ships * ratio_to_send) < 1: 
+        if int(active_planet.n_ships * ratio_to_send) <= 1: 
             return False
             
         return True
@@ -143,22 +143,29 @@ class GNNAgent(PlanetWarsPlayer):
     def get_action_mask(self, active_planet, game_state: GameState, obs_mapping: dict) -> np.ndarray:
         masks = np.zeros(self.total_action_bins, dtype=np.int8)
         
-        # Base Dispatch Actions
-        for target_idx in range(self.max_planets + 1):
+        # NOOP is always allowed
+        masks[self.noop_action_idx] = 1
+        
+        for target_idx in range(self.max_planets):
             for ratio_idx in range(len(self.fleet_buckets)):
                 if self.is_action_allowed(target_idx, ratio_idx, active_planet, game_state, obs_mapping):
                     flat_action_idx = (target_idx * len(self.fleet_buckets)) + ratio_idx
                     masks[flat_action_idx] = 1
-
-        # Fallback for safety
-        if not masks.any():
-            for r in range(len(self.fleet_buckets)):
-                masks[(self.max_planets * len(self.fleet_buckets)) + r] = 1
         return masks
 
     # ==========================================
     # OBSERVATION EXTRACTION
     # ==========================================
+    def _get_sorted_planets_by_distance(self, game_state: GameState, active_planet):
+        if active_planet is None:
+            return sorted(game_state.planets, key=lambda p: p.id)
+
+        other_planets = [p for p in game_state.planets if p.id != active_planet.id]
+        other_planets.sort(
+            key=lambda p: (active_planet.position.distance(p.position), p.id)
+        )
+        return [active_planet] + other_planets
+
     def _get_obs(self, game_state: GameState, active_planet) -> tuple[np.ndarray, dict]:
         obs = np.zeros((self.max_planets * self.features_per_node) + self.n_globals, dtype=np.float32)
         mapping = {}
@@ -196,9 +203,10 @@ class GNNAgent(PlanetWarsPlayer):
             incoming_friendly_fleets[p.id].sort(key=lambda x: x[1])
             incoming_enemy_fleets[p.id].sort(key=lambda x: x[1])
 
-        ordered_planets = sorted(game_state.planets, key=lambda p: p.id)
+        # --- EGOCENTRIC SORTING ---
+        ordered_planets = self._get_sorted_planets_by_distance(game_state, active_planet)
+        
         max_coord = max(self.params.width, self.params.height)
-        max_time = float(self.params.max_ticks)
         n_planets_current = len(ordered_planets)
 
         for i, planet in enumerate(ordered_planets):
@@ -209,9 +217,7 @@ class GNNAgent(PlanetWarsPlayer):
             obs[idx]   = 1.0 if planet.owner == self.player else 0.0
             obs[idx+1] = 1.0 if planet.owner == self.player.opponent() else 0.0
             obs[idx+2] = 1.0 if planet.owner == Player.Neutral else 0.0
-            
-            safe_ships = max(0.0, float(planet.n_ships))
-            obs[idx + 3] = np.log1p(safe_ships)
+            obs[idx+3] = np.log1p(float(planet.n_ships))
             
             estimated_ships = float(planet.n_ships)
             if planet.owner == self.player:
@@ -230,7 +236,7 @@ class GNNAgent(PlanetWarsPlayer):
                 if f_idx < len(f_fleets):
                     ships, eta = f_fleets[f_idx]
                     obs[idx + 7 + (f_idx * 2)] = np.log1p(max(0.0, ships))
-                    obs[idx + 8 + (f_idx * 2)] = 1.0 - (eta / max_time) 
+                    obs[idx + 8 + (f_idx * 2)] = (eta / self.max_eta)
                 else:
                     obs[idx + 7 + (f_idx * 2)] = 0.0
                     obs[idx + 8 + (f_idx * 2)] = 0.0
@@ -240,23 +246,22 @@ class GNNAgent(PlanetWarsPlayer):
                 if e_idx < len(e_fleets):
                     ships, eta = e_fleets[e_idx]
                     obs[idx + 13 + (e_idx * 2)] = np.log1p(max(0.0, ships))
-                    obs[idx + 14 + (e_idx * 2)] = 1.0 - (eta / max_time)
+                    obs[idx + 14 + (e_idx * 2)] = (eta / self.max_eta)
                 else:
                     obs[idx + 13 + (e_idx * 2)] = 0.0
                     obs[idx + 14 + (e_idx * 2)] = 0.0
 
             obs[idx + 19] = float(planet.growth_rate) / self.params.max_growth_rate
             
-            # --- Feature Repurposing matching the Training Arch ---
-            cd_left = max(0, self.planet_ready_tick.get(planet.id, 0) - game_state.game_tick)
-            obs[idx + 20] = min(1.0, cd_left / 50.0)
+            total_inc_e = sum(ships for ships, eta in incoming_enemy_fleets.get(planet.id, []))
+            obs[idx + 20] = 1.0 if (total_inc_e > 0 and planet.owner == self.player) else 0.0
             
-            for f_idx in range(self.old_flag_count - 1):
-                obs[idx + 21 + f_idx] = 0.0
-                
-            obs[idx + 25] = 1.0 if planet.id == active_planet.id else 0.0
-            obs[idx + 26] = planet.position.x / max_coord
-            obs[idx + 27] = planet.position.y / max_coord
+            distance_to_active = active_planet.position.distance(planet.position)
+            obs[idx + 21] = distance_to_active / max_coord
+            obs[idx + 22] = 1.0 if planet.id == active_planet.id else 0.0
+
+            obs[idx + 23] = planet.position.x / max_coord
+            obs[idx + 24] = planet.position.y / max_coord
             
         for i in range(n_planets_current, self.max_planets):
             idx = i * self.features_per_node
@@ -284,12 +289,11 @@ class GNNAgent(PlanetWarsPlayer):
 
         friendly_planets = [p for p in game_state.planets if p.owner == self.player]
 
-        # 1. Map incoming enemy fleets to destinations and track total fleets
+        # 1. Map incoming enemy fleets
         incoming_enemy_ships = {p.id: 0 for p in game_state.planets}
         incoming_friendly_ships = {p.id: 0 for p in game_state.planets}
 
         current_enemy_fleets = 0
-        
         for p in game_state.planets:
             if getattr(p, 'transporter', None) is not None and p.transporter.owner == self.player.opponent():
                 current_enemy_fleets += 1
@@ -297,129 +301,93 @@ class GNNAgent(PlanetWarsPlayer):
             elif getattr(p, 'transporter', None) is not None and p.transporter.owner == self.player:
                 incoming_friendly_ships[p.transporter.destination_index] += p.transporter.n_ships
 
-
-        
         # ==========================================
         # 2. HEURISTIC OVERRIDE LOGIC: OPPORTUNISTIC SNIPER
         # ==========================================
+        
         valid_sources = [
             p for p in friendly_planets 
-            if p.n_ships > 5 
+            if p.n_ships >= 1
             and getattr(p, 'transporter', None) is None 
             and current_tick >= self.planet_ready_tick.get(p.id, 0)
         ]
         
         non_friendly_planets = [p for p in game_state.planets if p.owner != self.player]
-        
-        best_attack = None
-        best_roi_score = -1.0  # Threshold for "is this attack worth overriding the NN?"
+        if self.heuristic_enabled:
+            best_attack = None
+            best_roi_score = -1.0 
 
-        for source in valid_sources:
-            # Localized Danger Check: Ensure THIS source planet is safe, ignore the rest of the board.
-            # We keep enough ships to survive incoming enemies, plus a buffer of 3 just in case.
-            minimum_safe_garrison = incoming_enemy_ships[source.id] + 3
+            for source in valid_sources:
+                minimum_safe_garrison = incoming_enemy_ships[source.id] + 3
 
-            for target in non_friendly_planets:
-                # If we are already sending ships there, trust the existing fleet and move on
-                if incoming_friendly_ships[target.id] > 0:
-                    continue
-                
-                eta = source.position.distance(target.position) / self.params.transporter_speed
-                
-                growth_defense = target.growth_rate * eta if target.owner == self.player.opponent() else 0
-                target_defense = target.n_ships + incoming_enemy_ships[target.id] + growth_defense
-                
-                required_attack_ships = int(target_defense) + 2
-                
-                # Check if we have enough to attack AND defend our home simultaneously
-                if source.n_ships >= (required_attack_ships + minimum_safe_garrison):
+                for target in non_friendly_planets:
+                    if incoming_friendly_ships[target.id] > 0:
+                        continue
                     
-                    # --- Calculate ROI (Return on Investment) ---
-                    # High growth, cheap required ships, and short distance score the highest.
-                    roi_score = (target.growth_rate * 5000.0) / (required_attack_ships * eta)
-                    #print(required_attack_ships, eta)
-                    # Neutral planets don't spawn enemy fleets, making them safer investments early game
-                    if target.owner == Player.Neutral:
-                        roi_score *= 1.5 
-                    #print(roi_score)
-                    # Find the absolute best move on the board
-                    if roi_score > best_roi_score:
-                        best_roi_score = roi_score
-                        best_attack = (source, target, required_attack_ships)
+                    eta = source.position.distance(target.position) / self.params.transporter_speed
+                    growth_defense = target.growth_rate * eta if target.owner == self.player.opponent() else 0
+                    target_defense = target.n_ships + incoming_enemy_ships[target.id] + growth_defense
+                    required_attack_ships = int(target_defense) + 2
+                    
+                    if source.n_ships >= (required_attack_ships + minimum_safe_garrison):
+                        roi_score = (target.growth_rate * 5000.0) / (required_attack_ships * eta)
+                        if target.owner == Player.Neutral:
+                            roi_score *= 1.5 
+                            
+                        if roi_score > best_roi_score:
+                            best_roi_score = roi_score
+                            best_attack = (source, target, required_attack_ships)
 
-        # Execute ONLY if we found a highly profitable move (adjust 2.0 threshold based on testing)
-        if best_attack and best_roi_score > 1:
-            source, target, required_attack_ships = best_attack
-            
-            self.planet_ready_tick[source.id] = current_tick + 5
-            
-                
-            #print(f"[Heuristic] Sniping planet {target.id} (Growth: {target.growth_rate}) with {required_attack_ships} ships from {source.id}. ROI: {best_roi_score:.2f}")
-            return Action(
-                player_id=self.player,
-                source_planet_id=source.id,
-                destination_planet_id=target.id,
-                num_ships=required_attack_ships
-            )
+            if best_attack and best_roi_score > 1.0:
+                source, target, required_attack_ships = best_attack
+                self.planet_ready_tick[source.id] = current_tick + 5
+                return Action(
+                    player_id=self.player,
+                    source_planet_id=source.id,
+                    destination_planet_id=target.id,
+                    num_ships=required_attack_ships
+                )
 
         # ==========================================
-        # 3. AI FALLBACK LOGIC
+        # 3. AI FALLBACK LOGIC (EGOCENTRIC EVALUATION)
         # ==========================================
-        
-        # 1. Βρίσκουμε όλους τους φίλιους πλανήτες που ΜΠΟΡΟΥΝ να δράσουν αυτό το tick.
-        valid_sources = [
-            p for p in game_state.planets 
-            if p.owner == self.player 
-            and p.n_ships >= 1 
-            and getattr(p, 'transporter', None) is None 
-            and current_tick >= self.planet_ready_tick.get(p.id, 0)
-        ]
-
-        # 2. Ανακατεύουμε για να μην ευνοείται πάντα ο πλανήτης με ID 0
-        random.shuffle(valid_sources)
-
-        # 3. Ρωτάμε το GNN για τον καθένα ξεχωριστά
-        for active_planet in valid_sources:
+        # Evaluate active planet
+        if valid_sources:
+            active_planet = min(valid_sources, key=lambda p: self.planet_ready_tick[p.id])
+    
             obs, obs_mapping = self._get_obs(game_state, active_planet)
             action_mask = self.get_action_mask(active_planet, game_state, obs_mapping)
             
             action_flat, _ = self.model.predict(obs, action_masks=action_mask, deterministic=self.det)
             action_int = int(action_flat)
             
-            if action_int < self.base_action_bins:
-                sorted_target_idx = action_int // len(self.fleet_buckets)
-                ratio_idx = action_int % len(self.fleet_buckets)
+            if action_int == self.noop_action_idx:
+                self.planet_ready_tick[active_planet.id] = current_tick + self.planet_cooldown
+                return Action.do_nothing()
+            
+            sorted_target_idx = action_int // len(self.fleet_buckets)
+            ratio_idx = action_int % len(self.fleet_buckets)
+            
+            real_target_id = obs_mapping.get(sorted_target_idx, None)
+            
+            if real_target_id is not None and real_target_id != active_planet.id:
+                ratio_to_send = self.fleet_buckets[ratio_idx]
+                ships_to_send = int(active_planet.n_ships * ratio_to_send)
                 
-                # Αν διάλεξε πλανήτη (Άρα Επίθεση/Μεταφορά)
-                if sorted_target_idx < self.max_planets:
-                    real_target_id = obs_mapping.get(sorted_target_idx, None)
-                    
-                    if real_target_id is not None and real_target_id != active_planet.id:
-                        ratio_to_send = self.fleet_buckets[ratio_idx]
-                        ships_to_send = int(active_planet.n_ships * ratio_to_send)
-                        
-                        if ships_to_send >= 1:
-                            # Επιτυχημένο action: Βάζουμε το 5-tick cooldown και επιστρέφουμε!
-                            self.planet_ready_tick[active_planet.id] = current_tick + 5
-                            #print(real_target_id, ships_to_send, game_state.game_tick)
-                            return Action(
-                                player_id=self.player,
-                                source_planet_id=active_planet.id,
-                                destination_planet_id=real_target_id,
-                                num_ships=ships_to_send
-                            )
-                            
-                self.planet_ready_tick[active_planet.id] = current_tick + 5
-            else:
-                # Masked Meta Actions (Safeguard)
-                self.planet_ready_tick[active_planet.id] = current_tick + 5
-
-        # Αν φτάσαμε εδώ, όλοι οι έτοιμοι πλανήτες επέλεξαν NOOP.
+                if ships_to_send >= 1:
+                    self.planet_ready_tick[active_planet.id] = current_tick + self.planet_cooldown
+                    return Action(
+                        player_id=self.player,
+                        source_planet_id=active_planet.id,
+                        destination_planet_id=real_target_id,
+                        num_ships=ships_to_send
+                    )
+        else:
+            return Action.do_nothing()
+        print("NOOP")
         return Action.do_nothing()
 
     def get_agent_type(self) -> str:
         return self.agent_type
 
-    
-    
-    
+
