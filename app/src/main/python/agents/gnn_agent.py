@@ -73,9 +73,9 @@ def manual_load_model(model_path):
     return new_model
     
     
- 
+
 class GNNAgent(PlanetWarsPlayer):
-    def __init__(self, model_path: str = "clean_weights.pth", max_planets: int = 30, det: bool = True, heuristic_fallback: bool=True):
+    def __init__(self, model_path: str = "clean_weights.pth", max_planets: int = 30, det: bool = True, heuristic_fallback: bool = True):
         super().__init__()
         self.model_name = os.path.basename(model_path)
         try:
@@ -389,5 +389,4 @@ class GNNAgent(PlanetWarsPlayer):
 
     def get_agent_type(self) -> str:
         return self.agent_type
-
 
